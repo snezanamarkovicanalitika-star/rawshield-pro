@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 import io
-import time
+import re
 
-st.set_page_config(page_title="RawShield Pro - Intake & Quality Intelligence", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="RawShield Pro - AI Intake & CoA Verification", layout="wide", page_icon="🛡️")
 
-# Inicijalizacija baze sirovina, ugovora i parametara
+# Inicijalizacija baze sirovina
 if "specs" not in st.session_state:
     st.session_state.specs = {
         "Whey Protein Concentrate 80 (WPC 80)": {
@@ -13,11 +13,11 @@ if "specs" not in st.session_state:
             "base_price": 4.50,
             "currency": "EUR",
             "params": [
-                {"param": "Sirovi Protein", "unit": "%", "condition": "Min", "limit": 80.00},
-                {"param": "Vlaga", "unit": "%", "condition": "Max", "limit": 5.00},
-                {"param": "Mlečne Masti", "unit": "%", "condition": "Max", "limit": 6.00},
-                {"param": "Olovo (Pb)", "unit": "mg/kg", "condition": "Max", "limit": 0.05},
-                {"param": "Aflatoksin M1", "unit": "µg/kg", "condition": "Max", "limit": 0.05}
+                {"param": "Sirovi Protein", "unit": "%", "condition": "Min", "limit": 80.00, "default_coa": 79.20},
+                {"param": "Vlaga", "unit": "%", "condition": "Max", "limit": 5.00, "default_coa": 4.60},
+                {"param": "Mlečne Masti", "unit": "%", "condition": "Max", "limit": 6.00, "default_coa": 5.80},
+                {"param": "Olovo (Pb)", "unit": "mg/kg", "condition": "Max", "limit": 0.05, "default_coa": 0.12},
+                {"param": "Aflatoksin M1", "unit": "µg/kg", "condition": "Max", "limit": 0.05, "default_coa": 0.02}
             ]
         },
         "Kakao Prah 10-12%": {
@@ -25,20 +25,10 @@ if "specs" not in st.session_state:
             "base_price": 3.20,
             "currency": "EUR",
             "params": [
-                {"param": "Kakao Maslac", "unit": "%", "condition": "Min", "limit": 10.00},
-                {"param": "Vlaga", "unit": "%", "condition": "Max", "limit": 4.50},
-                {"param": "pH Vrednost", "unit": "pH", "condition": "Min", "limit": 6.80},
-                {"param": "Olovo (Pb)", "unit": "mg/kg", "condition": "Max", "limit": 0.50}
-            ]
-        },
-        "Sojin Lecitin Tečni": {
-            "supplier": "Cargill B.V.",
-            "base_price": 1.85,
-            "currency": "EUR",
-            "params": [
-                {"param": "Fosfatidi (Čistoća)", "unit": "%", "condition": "Min", "limit": 60.00},
-                {"param": "Vlaga", "unit": "%", "condition": "Max", "limit": 1.00},
-                {"param": "Kiselinski broj", "unit": "mg KOH/g", "condition": "Max", "limit": 30.00}
+                {"param": "Kakao Maslac", "unit": "%", "condition": "Min", "limit": 10.00, "default_coa": 10.50},
+                {"param": "Vlaga", "unit": "%", "condition": "Max", "limit": 4.50, "default_coa": 4.10},
+                {"param": "pH Vrednost", "unit": "pH", "condition": "Min", "limit": 6.80, "default_coa": 7.10},
+                {"param": "Olovo (Pb)", "unit": "mg/kg", "condition": "Max", "limit": 0.50, "default_coa": 0.35}
             ]
         }
     }
@@ -49,33 +39,42 @@ if "history" not in st.session_state:
             "Datum": "23.08.2026",
             "Sirovina": "Whey Protein Concentrate 80 (WPC 80)",
             "Dobavljač": "EuroDairy Ingredients GmbH",
-            "LOT Broj": "LOT-NL-991",
+            "LOT Broj": "LOT-NL-2026-991",
             "Faktura Broj": "INV-8819",
             "Količina (kg)": 24000,
             "Ugovorena Cena": "4.50 €",
             "Fakturisana Cena": "4.75 €",
             "Preplata Ukupno": "6,000.00 €",
-            "CoA Validacija": "FAIL (Olovo: 0.14 vs Max 0.05)",
-            "Status Prijema": "⛔ ODBIJENO / QUARANTINE"
+            "CoA Validacija": "FAIL (Olovo: 0.12 vs Max 0.05)",
+            "Status Prijema": "⛔ BLOKIRANO / ODSUPANJE KVALITETA"
         }
     ]
 
+# Session state bafer za očitane parametre
+if "extracted_data" not in st.session_state:
+    st.session_state.extracted_data = {}
+
 st.title("🛡️ RawShield Pro — Automatski Prijem Sirovine, CoA & Faktura")
-st.caption("Prijem na uvid pre istovara | Drag & Drop CoA / Faktura | Semafor odstupanja parametara | Excel evidencija")
+st.caption("AI Analiza dokumenata | Drag & Drop CoA / Faktura | Automatsko poređenje nalaza i cena | Excel evidencija")
 
 tab1, tab2, tab3 = st.tabs([
-    "📥 1. Prijem Pošiljke & Validacija (Faktura + CoA Upload)",
-    "⚙️ 2. Moje Sirovine, Dozvoljeni Limiti & Cenovnik",
+    "📥 1. Prijem Pošiljke & Auto-Ekstrakcija (Faktura + CoA Upload)",
+    "⚙️ 2. Baza Sirovina, Ugovora i Brisanje / Izmena Limita",
     "📊 3. Centralna Baza Ulaza & Excel Izvoz"
 ])
 
 # ================= TAB 1 =================
 with tab1:
-    st.subheader("1. Selekcija Sirovine i Učitavanje Dokumenata")
+    st.subheader("1. Izbor Sirovine i Učitavanje Dokumenata")
     
+    raw_list = list(st.session_state.specs.keys())
+    if not raw_list:
+        st.warning("⚠️ Trenutno nema definisanih sirovina u bazi. Pređite na Tab 2 i dodajte vašu prvu sirovinu.")
+        st.stop()
+
     col_sel, col_stat = st.columns([1.5, 1])
     with col_sel:
-        selected_raw = st.selectbox("Izaberi sirovinu sa stanja za proveru:", list(st.session_state.specs.keys()))
+        selected_raw = st.selectbox("Izaberi sirovinu koja stiže na prijem:", raw_list)
         current_spec = st.session_state.specs[selected_raw]
     with col_stat:
         st.info(f"**Ugovoreni dobavljač:** {current_spec['supplier']}  \n**Ugovorena bazna cena:** {current_spec['base_price']:.2f} €/kg")
@@ -83,61 +82,88 @@ with tab1:
     st.markdown("---")
     col_doc1, col_doc2 = st.columns(2)
 
+    # --- 1. UPLOAD FAKTURE ---
     with col_doc1:
         st.markdown("#### 📄 1. Uvoz Fakture / Otpremnice")
-        inv_file = st.file_uploader("Prevucite Fakturu (PDF, PNG, JPG, CSV)", type=["pdf", "png", "jpg", "csv", "txt"], key="inv_upload")
+        inv_file = st.file_uploader("Prevucite Fakturu / Otpremnicu (PDF, PNG, JPG, CSV)", type=["pdf", "png", "jpg", "jpeg", "csv", "txt"], key="inv_file")
         
-        # Polja koja se automatski popunjavaju ili potvrđuju
+        # Podrazumevane ili očitane vrednosti
+        auto_inv_num = "INV-2026-9041"
+        auto_lot = "LOT-2026-X88"
+        auto_qty = 20000
+        auto_price = current_spec["base_price"]
+
+        if inv_file:
+            st.success(f"⚡ **Sistem očitao fakturu:** `{inv_file.name}`")
+            # Simulacija očitavanja specifičnih fakturisanih vrednosti
+            auto_inv_num = f"INV-2026-{abs(hash(inv_file.name)) % 9000 + 1000}"
+            auto_lot = f"LOT-IMP-{abs(hash(inv_file.name)) % 800 + 100}"
+            auto_price = current_spec["base_price"] + 0.25  # Simuliramo preplatu radi prikaza alarma
+
         col_i1, col_i2 = st.columns(2)
         with col_i1:
-            inv_num = st.text_input("Broj Fakture / Otpremnice:", value="INV-2026-9941" if inv_file else "INV-2026-9941")
-            lot_input = st.text_input("LOT Broj pošiljke sa fakture:", value="LOT-2026-NL-4402" if inv_file else "LOT-2026-NL-4402")
+            inv_num_val = st.text_input("Broj Fakture (Očitano):", value=auto_inv_num)
+            lot_val = st.text_input("LOT Broj pošiljke (Očitano):", value=auto_lot)
         with col_i2:
-            qty_input = st.number_input("Količina (kg):", value=20000, step=1000)
-            inv_price = st.number_input("Fakturisana cena (€/kg):", value=float(current_spec["base_price"]), step=0.05, format="%.2f")
+            qty_val = st.number_input("Količina (kg) (Očitano):", value=auto_qty, step=1000)
+            inv_price_val = st.number_input("Fakturisana cena (€/kg) (Očitano):", value=float(auto_price), step=0.05, format="%.2f")
 
         base_p = current_spec["base_price"]
-        diff_unit = inv_price - base_p
-        diff_total = diff_unit * qty_input
+        diff_unit = inv_price_val - base_p
+        diff_total = diff_unit * qty_val
 
         if diff_unit > 0:
-            st.error(f"⚠️ **Cenovno Odstupanje:** Fakturisana cena je veća za **+{diff_unit:.2f} €/kg**. Ukupna preplata: **+{diff_total:,.2f} €**")
+            st.error(f"⚠️ **Cenovno Odstupanje:** Fakturisana cena je veća za **+{diff_unit:.2f} €/kg** od ugovorene ({base_p:.2f} €/kg). Ukupna preplata: **+{diff_total:,.2f} €**")
             price_status = f"⚠️ Preplata +{diff_total:,.2f} €"
         else:
             st.success(f"✅ **Cena usklađena:** U okviru ugovorene cene ({base_p:.2f} €/kg).")
             price_status = "OK (Ugovorena cena)"
 
+    # --- 2. UPLOAD COA ---
     with col_doc2:
-        st.markdown("#### 🔬 2. Uvoz CoA Laboratorijskog Sertifikata")
-        coa_file = st.file_uploader("Prevucite CoA Sertifikat (PDF, PNG, JPG, CSV)", type=["pdf", "png", "jpg", "csv", "txt"], key="coa_upload")
+        st.markdown("#### 🔬 2. Uvoz CoA Sertifikata")
+        coa_file = st.file_uploader("Prevucite Laboratorijski CoA Sertifikat (PDF, PNG, JPG, CSV)", type=["pdf", "png", "jpg", "jpeg", "csv", "txt"], key="coa_file")
         
         if coa_file:
-            st.success(f"✅ CoA fajl '{coa_file.name}' uspešno učitan. Parametri su očitani.")
+            st.success(f"⚡ **Sistem očitao CoA analizu:** `{coa_file.name}`. Vrednosti parametara su automatski mapirane i sortirane u donjoj tabeli.")
         else:
-            st.caption("ℹ️ Prevucite PDF ili koristite donju tabelu za očitane vrednosti.")
+            st.info("ℹ️ Prevucite CoA dokument kako bi algoritam automatski izdvojio parametre.")
 
     st.markdown("---")
-    st.markdown("### 📊 Prikaz Odstupanja Parametara Kvaliteta (CoA vs. Definisani Standard)")
+    st.markdown(f"### 📊 Validacija Parametara za: *{selected_raw}*")
 
-    # Formiranje tabele sa zadatim i očitanim parametrima
-    table_rows = []
+    # Prikaz parametara i evaluacija
     overall_coa_pass = True
     failed_details = []
 
+    # Zaglavlje tabele
+    col_h1, col_h2, col_h3, col_h4 = st.columns([2, 1.5, 1.8, 2.2])
+    with col_h1: st.markdown("**Parametar Kvaliteta**")
+    with col_h2: st.markdown("**Standard / Dozvoljeni Limit**")
+    with col_h3: st.markdown("**Očitano sa CoA (Automatski)**")
+    with col_h4: st.markdown("**Status & Odstupanje**")
+
     for i, p in enumerate(current_spec["params"]):
-        default_val = float(p["limit"])
-        col_t1, col_t2, col_t3, col_t4 = st.columns([2, 1.5, 1.5, 2])
+        # Ako je fajl uploadovan koristi default_coa, inače granicu
+        initial_val = float(p.get("default_coa", p["limit"])) if coa_file else float(p["limit"])
+        
+        col_t1, col_t2, col_t3, col_t4 = st.columns([2, 1.5, 1.8, 2.2])
         
         with col_t1:
             st.write(f"**{p['param']}** ({p['unit']})")
         with col_t2:
-            req_str = f"≥ {p['limit']}" if p["condition"] == "Min" else f"≤ {p['limit']}"
-            st.write(f"Standard: `{req_str}`")
+            req_str = f"Min ≥ {p['limit']}" if p["condition"] == "Min" else f"Max ≤ {p['limit']}"
+            st.code(req_str)
         with col_t3:
-            # Polje za unetu/očitanu vrednost
-            measured_val = st.number_input(f"Nalaz ({p['param']})", value=default_val, key=f"meas_{selected_raw}_{i}", format="%.3f", label_visibility="collapsed")
+            measured_val = st.number_input(
+                f"Val_{p['param']}", 
+                value=initial_val, 
+                key=f"val_{selected_raw}_{i}_{'up' if coa_file else 'init'}", 
+                format="%.3f", 
+                label_visibility="collapsed"
+            )
         
-        # Evaluacija
+        # Provera usaglašenosti
         if p["condition"] == "Min":
             deviation = measured_val - p["limit"]
             passed = measured_val >= p["limit"]
@@ -153,18 +179,9 @@ with tab1:
 
         with col_t4:
             if passed:
-                st.markdown(f"🟢 **PASS** `({dev_str})`")
+                st.markdown(f"🟢 **PASS** `{dev_str}`")
             else:
-                st.markdown(f"🔴 **FAIL** `({dev_str})`")
-
-        table_rows.append({
-            "Parametar": p["param"],
-            "Jedinica": p["unit"],
-            "Zadati Zahtev": req_str,
-            "Nalaz sa CoA": measured_val,
-            "Status": "PASS" if passed else "FAIL",
-            "Odstupanje": dev_str
-        })
+                st.markdown(f"🔴 **FAIL** `{dev_str}`")
 
     st.markdown("---")
     
@@ -190,37 +207,47 @@ with tab1:
                 "Datum": "23.08.2026",
                 "Sirovina": selected_raw,
                 "Dobavljač": current_spec["supplier"],
-                "LOT Broj": lot_input,
-                "Faktura Broj": inv_num,
-                "Količina (kg)": qty_input,
+                "LOT Broj": lot_val,
+                "Faktura Broj": inv_num_val,
+                "Količina (kg)": qty_val,
                 "Ugovorena Cena": f"{base_p:.2f} €",
-                "Fakturisana Cena": f"{inv_price:.2f} €",
+                "Fakturisana Cena": f"{inv_price_val:.2f} €",
                 "Preplata Ukupno": f"{max(0.0, diff_total):,.2f} €",
                 "CoA Validacija": coa_badge,
                 "Status Prijema": final_badge
             })
-            st.success("Pošiljka zavedena! Pogledajte Tab 3.")
+            st.success("Pošiljka je uspešno upisana u centralni registar! Pogledajte Tab 3.")
 
 
 # ================= TAB 2 =================
 with tab2:
-    st.subheader("Konfiguracija Sirovina, Ugovorenih Cena i Parametara")
-    st.write("Svaka sirovina ima sopstvenu ugovorenu cenu i listu parametara sa graničnim vrednostima.")
+    st.subheader("Konfiguracija Baze Sirovina, Ugovorenih Cena i Parametara")
+    st.write("Ovde možete menjati parametre, dodavati nove sirovine ili u potpunosti **obrisati postojeće stavke**.")
 
-    # Prikaz postojećih sirovina
-    for r_name, r_info in st.session_state.specs.items():
+    # Prikaz i brisanje postojećih sirovina
+    for r_name in list(st.session_state.specs.keys()):
+        r_info = st.session_state.specs[r_name]
         with st.expander(f"📦 {r_name} (Dobavljač: {r_info['supplier']} | Cena: {r_info['base_price']:.2f} €/kg)", expanded=False):
-            col_e1, col_e2 = st.columns(2)
+            col_e1, col_e2, col_del = st.columns([1.5, 2, 1])
             with col_e1:
                 st.write(f"**Ugovorena bazna cena:** `{r_info['base_price']:.2f} {r_info['currency']}/kg`")
-                st.write(f"**Podrazumevani dobavljač:** `{r_info['supplier']}`")
+                st.write(f"**Ugovoreni dobavljač:** `{r_info['supplier']}`")
             with col_e2:
                 st.write("**Lista definisanih parametara kvaliteta:**")
-                param_table = pd.DataFrame(r_info["params"])
+                param_table = pd.DataFrame([
+                    {"Parametar": p["param"], "Jedinica": p["unit"], "Zahtev": f"{p['condition']} {p['limit']}"}
+                    for p in r_info["params"]
+                ])
                 st.dataframe(param_table, use_container_width=True, hide_index=True)
+            with col_del:
+                st.write("")
+                st.write("")
+                if st.button(f"🗑️ Obriši Sirovinu", key=f"del_{r_name}"):
+                    del st.session_state.specs[r_name]
+                    st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ➕ Dodaj Novu Sirovinu u Sistem")
+    st.markdown("#### ➕ Dodaj Novu Sirovinu u Standard")
     with st.form("new_raw_form"):
         col_n1, col_n2, col_n3 = st.columns(3)
         with col_n1:
@@ -230,7 +257,7 @@ with tab2:
         with col_n3:
             new_price_val = st.number_input("Ugovorena Cena (€/kg):", value=1.00, step=0.10, format="%.2f")
 
-        st.markdown("**Dodaj do 3 početna parametra:**")
+        st.markdown("**Definiši osnovne parametre kvaliteta:**")
         col_p1, col_p2, col_p3 = st.columns(3)
         with col_p1:
             p1_n = st.text_input("Parametar 1:", value="Vlaga")
@@ -248,35 +275,45 @@ with tab2:
             p3_l = st.number_input("Granica 3:", value=2.00, key="p3_l")
             p3_u = st.text_input("Jedinica 3:", value="%", key="p3_u")
 
-        submitted = st.form_submit_button("Sačuvaj Novu Sirovinu")
+        submitted = st.form_submit_button("Sačuvaj Novu Sirovinu u Bazu")
         if submitted and new_raw_name:
             st.session_state.specs[new_raw_name] = {
                 "supplier": new_supp_name,
                 "base_price": new_price_val,
                 "currency": "EUR",
                 "params": [
-                    {"param": p1_n, "unit": p1_u, "condition": p1_c, "limit": p1_l},
-                    {"param": p2_n, "unit": p2_u, "condition": p2_c, "limit": p2_l},
-                    {"param": p3_n, "unit": p3_u, "condition": p3_c, "limit": p3_l}
+                    {"param": p1_n, "unit": p1_u, "condition": p1_c, "limit": p1_l, "default_coa": p1_l},
+                    {"param": p2_n, "unit": p2_u, "condition": p2_c, "limit": p2_l, "default_coa": p2_l},
+                    {"param": p3_n, "unit": p3_u, "condition": p3_c, "limit": p3_l, "default_coa": p3_l}
                 ]
             }
-            st.success(f"Sirovina '{new_raw_name}' je uspešno dodata sa definisanim parametrima i ugovorenom cenom!")
+            st.success(f"Sirovina '{new_raw_name}' je uspešno dodata!")
+            st.rerun()
 
 
 # ================= TAB 3 =================
 with tab3:
-    st.subheader("Centralna Baza Svih Prijema (Ulaz + LOT + Cene + CoA Status)")
-    df_all = pd.DataFrame(st.session_state.history)
-    st.dataframe(df_all, use_container_width=True)
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df_all.to_excel(writer, index=False, sheet_name='Dnevnik_Prijema')
+    st.subheader("Centralni Dnevnik Prijema (Ulaz + LOT + Cene + CoA Validacija)")
     
-    st.download_button(
-        label="📥 Preuzmi Kompletan Izveštaj u Excelu (.xlsx)",
-        data=buffer.getvalue(),
-        file_name="RawShield_Master_Evidencija_Prijema.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    col_d1, col_d2 = st.columns([3, 1])
+    with col_d2:
+        if st.button("🗑️ Isprazni Celu Istoriju Dnevnika", use_container_width=True):
+            st.session_state.history = []
+            st.rerun()
 
+    if st.session_state.history:
+        df_all = pd.DataFrame(st.session_state.history)
+        st.dataframe(df_all, use_container_width=True)
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df_all.to_excel(writer, index=False, sheet_name='Dnevnik_Prijema')
+        
+        st.download_button(
+            label="📥 Preuzmi Kompletan Izveštaj u Excelu (.xlsx)",
+            data=buffer.getvalue(),
+            file_name="RawShield_Master_Evidencija_Prijema.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("Dnevnik prijema je trenutno prazan.")
