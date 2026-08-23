@@ -1,163 +1,159 @@
 import streamlit as st
 import pandas as pd
 import io
-import re
-import pdfplumber
+import json
+import google.generativeai as genai
 
-st.set_page_config(page_title="RawShield Pro - Universal AI Intake", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="RawShield Pro - Multimodal AI Intake", layout="wide", page_icon="🛡️")
 
-# Pomoćna funkcija: Automatsko izvlačenje teksta i tabela iz PDF-a
-def parse_pdf_document(file_bytes):
-    full_text = ""
-    extracted_tables = []
+# Inicijalizacija Gemini AI
+api_key = st.secrets.get("GEMINI_API_KEY", None)
+if api_key:
+    genai.configure(api_key=api_key)
+
+def extract_with_gemini(uploaded_file, doc_type):
+    if not api_key:
+        return {"error": "API ključ nije podešen u Streamlit Secrets."}
     
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text += t + "\n"
-            tables = page.extract_tables()
-            for tbl in tables:
-                if tbl and len(tbl) > 1:
-                    extracted_tables.append(tbl)
-                    
-    return full_text, extracted_tables
+    file_bytes = uploaded_file.getvalue()
+    mime_type = uploaded_file.type if uploaded_file.type else "application/pdf"
 
-# Pomoćna funkcija: Heurističko čišćenje i mapiranje CoA tabele
-def build_coa_dataframe(tables, text):
-    rows = []
-    
-    # 1. Ako postoje prepoznate tabele u PDF-u
-    for tbl in tables:
-        for row in tbl:
-            clean_row = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
-            if len(clean_row) >= 2:
-                # Filtriramo zaglavlja
-                first_cell = clean_row[0].lower()
-                if any(h in first_cell for h in ["parameter", "parametar", "analiza", "test", "item", "naziv"]):
-                    continue
-                rows.append(clean_row)
+    if doc_type == "invoice":
+        prompt = """
+        Ti si stručnjak za analizu faktura i prijemnih dokumenata u prehrambenoj i hemijskoj industriji.
+        Analiziraj priloženi dokument (fakturu/otpremnicu) i vrati isključivo čist JSON format sa sledećim ključevima:
+        {
+            "supplier": "Naziv dobavljača/prodavca",
+            "invoice_number": "Broj fakture/otpremnice",
+            "lot_number": "LOT ili Batch broj pošiljke",
+            "quantity_kg": 10000,
+            "unit_price_eur": 2.50,
+            "raw_material_name": "Naziv sirovine"
+        }
+        Ako neki podatak nedostaje, proceni ili ostavi prazan string. Nemoj pisati markdown tagove poput ```json, vrati samo čist JSON.
+        """
+    else:
+        prompt = """
+        Ti si stručnjak za kontrolu kvaliteta i laboratorijske analize (CoA sertifikate).
+        Analiziraj priloženi sertifikat analize / CoA dokument i vrati isključivo čist JSON format sa listom svih očitanih parametara:
+        {
+            "raw_material_name": "Naziv sirovine sa analize",
+            "lot_number": "LOT broj sa CoA",
+            "parameters": [
+                {
+                    "param": "Naziv parametra (npr. Protein, Vlaga, Brix, Pepeo, Olovo)",
+                    "unit": "Jedinica mere (npr. %, mg/kg, °Bx)",
+                    "measured_value": 12.5,
+                    "specification_limit": "npr. Max ≤ 5.0 ili Min ≥ 10"
+                }
+            ]
+        }
+        Nemoj pisati markdown tagove poput ```json, vrati samo čist JSON.
+        """
 
-    # 2. Ako tabela nije u klasičnom formatu, parsiramo liniju po liniju iz teksta
-    if not rows and text:
-        lines = text.split("\n")
-        for line in lines:
-            parts = re.split(r'\s{2,}|\t|\|', line.strip())
-            parts = [p.strip() for p in parts if p.strip()]
-            if len(parts) >= 2 and any(char.isdigit() for char in parts[-1]):
-                rows.append(parts)
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([
+            {"mime_type": mime_type, "data": file_bytes},
+            prompt
+        ])
+        clean_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
+    except Exception as e:
+        return {"error": str(e)}
 
-    parsed_records = []
-    for r in rows:
-        param_name = r[0]
-        # Pronalazak brojeva u redu
-        numbers = re.findall(r'[-+]?[0-9]+(?:[\.,][0-9]+)?', " ".join(r[1:]))
-        if numbers:
-            val_found = numbers[0].replace(",", ".")
-            limit_found = numbers[1].replace(",", ".") if len(numbers) > 1 else "-"
-            unit_found = r[1] if len(r) > 2 and not any(c.isdigit() for c in r[1]) else ""
-            
-            parsed_records.append({
-                "Parametar": param_name,
-                "Jedinica": unit_found,
-                "Izmerena Vrednost (CoA)": val_found,
-                "Zadata Specifikacija / Limit": limit_found
-            })
-            
-    return pd.DataFrame(parsed_records)
-
-# Inicijalizacija istorije
+# Baza i istorija
 if "history" not in st.session_state:
     st.session_state.history = []
 
-st.title("🛡️ RawShield Pro — Autonomni Prijem, OCR & Validacija")
-st.caption("Samostalno čitanje dokumenata | Nema ručnog unosa | Automatska detekcija odstupanja i cena")
+st.title("🛡️ RawShield Pro — Autonomni AI OCR Prijem & Validacija")
+st.caption("AI Multimodal Parser | Čitanje skeniranih faktura i laboratorijskih nalaza | Automatsko mapiranje")
 
-st.markdown("### 📥 Prevucite dokumente za automatsku obradu")
-col_up1, col_up2 = st.columns(2)
+if not api_key:
+    st.warning("⚠️ Podešavanje u toku: Potrebno je uneti `GEMINI_API_KEY` u Streamlit Secrets kako bi AI mogao da skenira fizičke PDF dokumente.")
 
-with col_up1:
-    invoice_doc = st.file_uploader("1. Prevucite Fakturu / Otpremnicu (PDF):", type=["pdf"], key="u_inv")
-with col_up2:
-    coa_doc = st.file_uploader("2. Prevucite Laboratorijski Sertifikat / CoA (PDF):", type=["pdf"], key="u_coa")
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    inv_file = st.file_uploader("1. Prevucite Fakturu / Otpremnicu (PDF ili Sliku)", type=["pdf", "png", "jpg", "jpeg"], key="inv_file_ai")
+with col_u2:
+    coa_file = st.file_uploader("2. Prevucite CoA Sertifikat Analize (PDF ili Sliku)", type=["pdf", "png", "jpg", "jpeg"], key="coa_file_ai")
 
 st.divider()
 
-col_res1, col_res2 = st.columns([1, 1.2])
+col_out1, col_out2 = st.columns([1, 1.3])
 
-# ================= LEVA KOLONA: FAKTURA =================
-with col_res1:
-    st.subheader("📄 Automatski Očitani Podaci Fakture")
-    if invoice_doc:
-        inv_text, _ = parse_pdf_document(invoice_doc.getvalue())
+parsed_invoice = None
+parsed_coa = None
+
+# ================= OBRADA FAKTURE =================
+with col_out1:
+    st.subheader("📄 Ekstrakcija Podataka Fakture")
+    if inv_file and api_key:
+        with st.spinner("AI skenira fakturu..."):
+            parsed_invoice = extract_with_gemini(inv_file, "invoice")
         
-        # Automatska ekstrakcija ključnih pojmova
-        supplier_match = re.search(r'(?:dobavljač|supplier|prodavac|vendor)[\s\:\-]+([^\n\,]+)', inv_text, re.IGNORECASE)
-        inv_match = re.search(r'(?:racun|faktura|inv|invoice|br\.)[\s\:\#\-]*([A-Za-z0-9\-\/]+)', inv_text, re.IGNORECASE)
-        lot_match = re.search(r'(?:lot|šarža|sarza|batch)[\s\:\#\-]*([A-Za-z0-9\-\/]+)', inv_text, re.IGNORECASE)
-        qty_match = re.search(r'([0-9]+(?:[\.\,][0-9]+)?)\s*(?:kg|t|lit|kom)', inv_text, re.IGNORECASE)
-        price_match = re.search(r'([0-9]+(?:[\.\,][0-9]+)?)\s*(?:eur|€|\$|din|rsd)', inv_text, re.IGNORECASE)
-
-        s_name = supplier_match.group(1).strip() if supplier_match else invoice_doc.name.split(".")[0].upper()
-        i_num = inv_match.group(1).strip() if inv_match else f"RN-{abs(hash(invoice_doc.name)) % 10000}"
-        l_num = lot_match.group(1).strip() if lot_match else "LOT-POŠILJKE"
-        q_val = qty_match.group(1).replace(",", ".") if qty_match else "10000"
-        p_val = price_match.group(1).replace(",", ".") if price_match else "0.00"
-
-        st.success(f"✅ Faktura pročitana: `{invoice_doc.name}`")
-        st.write(f"🏢 **Dobavljač:** `{s_name}`")
-        st.write(f"🔢 **Broj Fakture:** `{i_num}`")
-        st.write(f"📦 **LOT Broj:** `{l_num}`")
-        st.write(f"⚖️ **Količina:** `{q_val} kg`")
-        st.write(f"💶 **Fakturisana cena:** `{p_val} €/kg`")
-    else:
-        st.info("Ubaci fajl fakture da sistem sam izvuče finansijske podatke.")
-
-# ================= DESNA KOLONA: COA =================
-with col_res2:
-    st.subheader("🔬 Automatski Očitani Parametri sa CoA")
-    if coa_doc:
-        coa_text, coa_tables = parse_pdf_document(coa_doc.getvalue())
-        df_coa = build_coa_dataframe(coa_tables, coa_text)
-
-        st.success(f"✅ CoA sertifikat pročitan: `{coa_doc.name}`")
-        
-        if not df_coa.empty:
-            st.markdown("##### Prepoznata tabela parametara i vrednosti:")
-            st.dataframe(df_coa, use_container_width=True, hide_index=True)
-            
-            st.success("🟢 Dokument je strukturiran i spreman za arhiviranje i kontrolu.")
+        if "error" in parsed_invoice:
+            st.error(f"Greška pri obradi: {parsed_invoice['error']}")
         else:
-            st.warning("Tekst je izvučen, ali parametri nisu u standardnoj tabeli. Prikaz sirovog teksta:")
-            st.text_area("Sadržaj:", coa_text, height=200)
-    else:
-        st.info("Ubaci CoA PDF da sistem sam pročita analizu.")
+            st.success(f"✅ Faktura uspešno očitana: `{inv_file.name}`")
+            st.write(f"🏢 **Dobavljač:** `{parsed_invoice.get('supplier', 'N/A')}`")
+            st.write(f"📦 **Sirovina:** `{parsed_invoice.get('raw_material_name', 'N/A')}`")
+            st.write(f"🔢 **Broj Fakture:** `{parsed_invoice.get('invoice_number', 'N/A')}`")
+            st.write(f"🏷️ **LOT Broj:** `{parsed_invoice.get('lot_number', 'N/A')}`")
+            st.write(f"⚖️ **Količina:** `{parsed_invoice.get('quantity_kg', 0)} kg`")
+            st.write(f"💶 **Cena:** `{parsed_invoice.get('unit_price_eur', 0.0):.2f} €/kg`")
+    elif not inv_file:
+        st.info("Ubaci fakturu u polje iznad.")
+
+# ================= OBRADA COA =================
+with col_out2:
+    st.subheader("🔬 Ekstrakcija Laboratorijskih Nalaza (CoA)")
+    if coa_file and api_key:
+        with st.spinner("AI analizira parametre sa sertifikata..."):
+            parsed_coa = extract_with_gemini(coa_file, "coa")
+
+        if "error" in parsed_coa:
+            st.error(f"Greška pri obradi: {parsed_coa['error']}")
+        else:
+            st.success(f"✅ CoA sertifikat uspešno očitan: `{coa_file.name}`")
+            st.write(f"📦 **Identifikovana sirovina:** `{parsed_coa.get('raw_material_name', 'N/A')}`")
+            st.write(f"🏷️ **LOT sa analize:** `{parsed_coa.get('lot_number', 'N/A')}`")
+
+            params_list = parsed_coa.get("parameters", [])
+            if params_list:
+                df_params = pd.DataFrame(params_list)
+                st.dataframe(df_params, use_container_width=True, hide_index=True)
+                st.success("🟢 Svi parametri, jedinice i vrednosti su automatski prepoznati i razvrstani.")
+    elif not coa_file:
+        st.info("Ubaci CoA sertifikat u polje iznad.")
 
 st.divider()
 
-# ================= AKCIJA I EVIDENCIJA =================
-if invoice_doc or coa_doc:
-    if st.button("💾 Zavedi Očitane Podatke u Master Dnevnik", use_container_width=True):
+if st.button("💾 Zavedi Pošiljku u Centralni Registar", use_container_width=True):
+    if parsed_invoice or parsed_coa:
         st.session_state.history.insert(0, {
             "Datum": "23.08.2026",
-            "Dokument Fakture": invoice_doc.name if invoice_doc else "N/A",
-            "Dokument CoA": coa_doc.name if coa_doc else "N/A",
-            "Status": "✅ OČITANO I PROCESUIRANO"
+            "Faktura Fajl": inv_file.name if inv_file else "N/A",
+            "CoA Fajl": coa_file.name if coa_file else "N/A",
+            "Dobavljač": parsed_invoice.get("supplier", "N/A") if parsed_invoice and "error" not in parsed_invoice else "N/A",
+            "Broj Fakture": parsed_invoice.get("invoice_number", "N/A") if parsed_invoice and "error" not in parsed_invoice else "N/A",
+            "LOT": parsed_invoice.get("lot_number", "N/A") if parsed_invoice and "error" not in parsed_invoice else (parsed_coa.get("lot_number", "N/A") if parsed_coa else "N/A"),
+            "Status": "✅ PROCESUIRANO"
         })
-        st.success("Pošiljka uspešno evidentirana!")
+        st.success("Uspešno evidentirano!")
 
 if st.session_state.history:
-    st.markdown("### 📊 Master Evidencija Prijema")
+    st.markdown("### 📊 Centralna Baza Evidencije")
     df_h = pd.DataFrame(st.session_state.history)
     st.dataframe(df_h, use_container_width=True)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df_h.to_excel(writer, index=False, sheet_name='Dnevnik')
-    
+
     st.download_button(
         label="📥 Preuzmi Dnevnik u Excelu (.xlsx)",
         data=buffer.getvalue(),
-        file_name="Automatski_Dnevnik_Ulaza.xlsx",
+        file_name="RawShield_Evidencija.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
